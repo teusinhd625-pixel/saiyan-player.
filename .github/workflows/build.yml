@@ -32,7 +32,7 @@ jobs:
 
       - name: Aplicar icone do app
         run: |
-          ICON=$(ls ./*.png 2>/dev/null | head -n 1)
+          ICON=$(find . -maxdepth 1 -type f -iname "*.png" | head -n 1)
           if [ -z "$ICON" ]; then
             echo "Nenhum arquivo .png encontrado na raiz do repositorio"
             ls -la
