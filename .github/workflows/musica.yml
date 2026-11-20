@@ -1,0 +1,476 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Criar projeto Capacitor
+        run: |
+          mkdir -p www
+          cp ./*.html www/index.html
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          npx cap init "Control Music" com.teusinhd625.controlmusic --web-dir=www
+          npx cap add android
+          npx cap sync android
+
+      - name: Aplicar icone do app
+        run: |
+          ICON=$(ls ./*.png 2>/dev/null | head -n 1)
+          if [ -z "$ICON" ]; then
+            echo "Nenhum arquivo .png encontrado na raiz do repositorio"
+            ls -la
+            exit 1
+          fi
+          echo "Usando icone: $ICON"
+          pip install pillow
+          ICON_PATH="$ICON" python3 - <<'EOF'
+          import os, shutil
+          from PIL import Image
+
+          icon = Image.open(os.environ["ICON_PATH"]).convert("RGBA")
+          res = "android/app/src/main/res"
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+          shutil.rmtree(res + "/mipmap-anydpi-v26", ignore_errors=True)
+
+          for name, size in sizes.items():
+              folder = f"{res}/mipmap-{name}"
+              os.makedirs(folder, exist_ok=True)
+              img = icon.resize((size, size), Image.LANCZOS)
+              for fn in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                  img.save(f"{folder}/{fn}")
+          print("Icones gerados com sucesso")
+          EOF
+
+      - name: Controle de musica (cartao de midia)
+        run: |
+          JDIR=android/app/src/main/java/com/teusinhd625/controlmusic
+          mkdir -p $JDIR
+
+          cat > $JDIR/MainActivity.java <<'JAVA'
+          package com.teusinhd625.controlmusic;
+
+          import android.Manifest;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(MediaCtlPlugin.class);
+              super.onCreate(savedInstanceState);
+              if (Build.VERSION.SDK_INT >= 33) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+              }
+            }
+
+            private void keepWeb() {
+              try {
+                WebView w = getBridge().getWebView();
+                MusicService.web = w;
+                w.onResume();
+                w.resumeTimers();
+              } catch (Exception e) {}
+            }
+
+            @Override
+            public void onResume() {
+              super.onResume();
+              keepWeb();
+              try { stopService(new Intent(this, MusicService.class)); } catch (Exception e) {}
+            }
+
+            @Override
+            public void onPause() {
+              super.onPause();
+              keepWeb();
+              if (!MediaState.has()) return;
+              try {
+                Intent i = new Intent(this, MusicService.class);
+                if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                else startService(i);
+              } catch (Exception e) {}
+            }
+
+            @Override
+            public void onStop() {
+              super.onStop();
+              keepWeb();
+            }
+          }
+          JAVA
+
+          cat > $JDIR/MediaCtlPlugin.java <<'JAVA'
+          package com.teusinhd625.controlmusic;
+
+          import android.app.DownloadManager;
+          import android.content.Context;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.net.Uri;
+          import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.util.Base64;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          class MediaState {
+            static volatile String title = "";
+            static volatile String artist = "";
+            static volatile String album = "";
+            static volatile boolean playing = false;
+            static volatile long posMs = 0;
+            static volatile long durMs = 0;
+            static volatile long stamp = 0;
+            static volatile Bitmap art = null;
+            static volatile String artKey = "";
+            static boolean has() { return title != null && !title.isEmpty(); }
+          }
+
+          @CapacitorPlugin(name = "MediaCtl")
+          public class MediaCtlPlugin extends Plugin {
+            private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+            static void poke() {
+              MAIN.post(new Runnable() {
+                public void run() {
+                  MusicService s = MusicService.inst;
+                  if (s != null) s.refresh();
+                }
+              });
+            }
+
+            private static String nz(String s) { return s == null ? "" : s; }
+
+            private static long num(String s) {
+              try { return Long.parseLong(s); } catch (Exception e) { return 0; }
+            }
+
+            @PluginMethod
+            public void update(PluginCall call) {
+              MediaState.title = nz(call.getString("title"));
+              MediaState.artist = nz(call.getString("artist"));
+              MediaState.album = nz(call.getString("album"));
+              MediaState.playing = "1".equals(call.getString("playing"));
+              MediaState.posMs = num(call.getString("pos"));
+              MediaState.durMs = num(call.getString("dur"));
+              MediaState.stamp = SystemClock.elapsedRealtime();
+
+              final String art = nz(call.getString("art"));
+              if (!art.equals(MediaState.artKey)) {
+                MediaState.artKey = art;
+                MediaState.art = null;
+                new Thread(new Runnable() {
+                  public void run() {
+                    Bitmap b = loadArt(art);
+                    if (art.equals(MediaState.artKey)) {
+                      MediaState.art = b;
+                      poke();
+                    }
+                  }
+                }).start();
+              }
+              poke();
+              call.resolve();
+            }
+
+            @PluginMethod
+            public void download(PluginCall call) {
+              try {
+                String url = call.getString("url");
+                String name = call.getString("name");
+                if (url == null || !url.startsWith("http")) {
+                  call.reject("url invalida");
+                  return;
+                }
+                if (name == null || name.isEmpty()) name = "musica.mp3";
+                DownloadManager dm = (DownloadManager) getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+                DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+                r.setTitle(name);
+                r.setDescription("Control Music");
+                r.setMimeType("audio/mpeg");
+                r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+                dm.enqueue(r);
+                call.resolve();
+              } catch (Exception e) {
+                call.reject("erro: " + e.getMessage());
+              }
+            }
+
+            private static Bitmap loadArt(String a) {
+              try {
+                if (a == null || a.isEmpty()) return null;
+                if (a.startsWith("data:")) {
+                  int i = a.indexOf(",");
+                  byte[] d = Base64.decode(a.substring(i + 1), Base64.DEFAULT);
+                  return BitmapFactory.decodeByteArray(d, 0, d.length);
+                }
+                if (a.startsWith("http")) {
+                  HttpURLConnection c = (HttpURLConnection) new URL(a).openConnection();
+                  c.setConnectTimeout(8000);
+                  c.setReadTimeout(8000);
+                  InputStream in = c.getInputStream();
+                  Bitmap b = BitmapFactory.decodeStream(in);
+                  in.close();
+                  return b;
+                }
+              } catch (Exception e) {}
+              return null;
+            }
+          }
+          JAVA
+
+          cat > $JDIR/MusicService.java <<'JAVA'
+          package com.teusinhd625.controlmusic;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.drawable.Icon;
+          import android.media.MediaMetadata;
+          import android.media.session.MediaSession;
+          import android.media.session.PlaybackState;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.webkit.WebView;
+
+          public class MusicService extends Service {
+            public static WebView web;
+            public static MusicService inst;
+            private static final String CH = "ctl_music_media";
+            private static final int ID = 7;
+            private static final String JS_TOGGLE = "try{if(!media.paused){window.userPause=true}toggle()}catch(e){}";
+            private static final String JS_PLAY = "try{window.userPause=false;initAudio();media.play()}catch(e){}";
+            private static final String JS_PAUSE = "try{window.userPause=true;media.pause()}catch(e){}";
+            private static final String JS_NEXT = "try{step(1,true)}catch(e){}";
+            private static final String JS_PREV = "try{step(-1,true)}catch(e){}";
+
+            private final Handler h = new Handler(Looper.getMainLooper());
+            private int taps = 0;
+            private MediaSession session;
+            private Bitmap fb;
+
+            private final Runnable fire = new Runnable() {
+              public void run() {
+                int n = taps;
+                taps = 0;
+                if (n == 1) js(JS_TOGGLE);
+                else if (n == 2) js(JS_NEXT);
+                else if (n >= 3) js(JS_PREV);
+              }
+            };
+
+            private void js(final String code) {
+              final WebView w = web;
+              if (w == null) return;
+              w.post(new Runnable() {
+                public void run() { w.evaluateJavascript(code, null); }
+              });
+            }
+
+            private PendingIntent pi(String action, int code) {
+              Intent i = new Intent(this, MusicService.class);
+              i.setAction(action);
+              return PendingIntent.getService(this, code, i,
+                  PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            }
+
+            private Notification.Action act(int icon, String label, String action, int code) {
+              return new Notification.Action.Builder(Icon.createWithResource(this, icon), label, pi(action, code)).build();
+            }
+
+            private Bitmap fallback() {
+              if (fb == null) {
+                try {
+                  int id = getResources().getIdentifier("ic_launcher", "mipmap", getPackageName());
+                  if (id != 0) fb = BitmapFactory.decodeResource(getResources(), id);
+                } catch (Exception e) {}
+              }
+              return fb;
+            }
+
+            private Notification buildNotification(String title, Bitmap art) {
+              NotificationManager nm = getSystemService(NotificationManager.class);
+              if (Build.VERSION.SDK_INT >= 26) {
+                nm.createNotificationChannel(new NotificationChannel(CH, "Reprodução de música",
+                    NotificationManager.IMPORTANCE_LOW));
+              }
+              Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                  ? new Notification.Builder(this, CH) : new Notification.Builder(this);
+              int pp = MediaState.playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play;
+              b.setSmallIcon(android.R.drawable.ic_media_play)
+                  .setContentTitle(title)
+                  .setContentText(MediaState.artist)
+                  .setOngoing(true)
+                  .setOnlyAlertOnce(true)
+                  .setShowWhen(false)
+                  .setVisibility(Notification.VISIBILITY_PUBLIC)
+                  .setContentIntent(pi("TAP", 0))
+                  .addAction(act(android.R.drawable.ic_media_previous, "Anterior", "PREV", 1))
+                  .addAction(act(pp, "Play/Pause", "PP", 2))
+                  .addAction(act(android.R.drawable.ic_media_next, "Próxima", "NEXT", 3))
+                  .setStyle(new Notification.MediaStyle()
+                      .setMediaSession(session.getSessionToken())
+                      .setShowActionsInCompactView(0, 1, 2));
+              if (art != null) b.setLargeIcon(art);
+              if (Build.VERSION.SDK_INT >= 31) {
+                b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+              }
+              return b.build();
+            }
+
+            public void refresh() {
+              if (session == null) return;
+              long pos = MediaState.posMs;
+              if (MediaState.playing) pos += SystemClock.elapsedRealtime() - MediaState.stamp;
+              if (MediaState.durMs > 0 && pos > MediaState.durMs) pos = MediaState.durMs;
+              if (pos < 0) pos = 0;
+
+              Bitmap art = MediaState.art != null ? MediaState.art : fallback();
+              String title = MediaState.title.isEmpty() ? "Control Music" : MediaState.title;
+
+              MediaMetadata.Builder mb = new MediaMetadata.Builder()
+                  .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                  .putString(MediaMetadata.METADATA_KEY_ARTIST, MediaState.artist)
+                  .putString(MediaMetadata.METADATA_KEY_ALBUM, MediaState.album)
+                  .putLong(MediaMetadata.METADATA_KEY_DURATION, MediaState.durMs);
+              if (art != null) {
+                mb.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art);
+                mb.putBitmap(MediaMetadata.METADATA_KEY_ART, art);
+              }
+              session.setMetadata(mb.build());
+
+              long acts = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
+                  | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_SKIP_TO_NEXT
+                  | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SEEK_TO;
+              session.setPlaybackState(new PlaybackState.Builder()
+                  .setActions(acts)
+                  .setState(MediaState.playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
+                      pos, MediaState.playing ? 1f : 0f, SystemClock.elapsedRealtime())
+                  .build());
+              session.setActive(true);
+
+              Notification n = buildNotification(title, art);
+              if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+              } else {
+                startForeground(ID, n);
+              }
+            }
+
+            @Override
+            public void onCreate() {
+              super.onCreate();
+              inst = this;
+              session = new MediaSession(this, "ControlMusic");
+              session.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
+              session.setCallback(new MediaSession.Callback() {
+                @Override public void onPlay() { js(JS_PLAY); }
+                @Override public void onPause() { js(JS_PAUSE); }
+                @Override public void onSkipToNext() { js(JS_NEXT); }
+                @Override public void onSkipToPrevious() { js(JS_PREV); }
+                @Override public void onSeekTo(long p) {
+                  js("try{media.currentTime=" + (p / 1000.0) + "}catch(e){}");
+                }
+              });
+              session.setActive(true);
+              refresh();
+            }
+
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+              refresh();
+              String a = intent == null ? null : intent.getAction();
+              if ("TAP".equals(a)) {
+                taps++;
+                h.removeCallbacks(fire);
+                h.postDelayed(fire, 650);
+              } else if ("PP".equals(a)) {
+                js(JS_TOGGLE);
+              } else if ("NEXT".equals(a)) {
+                js(JS_NEXT);
+              } else if ("PREV".equals(a)) {
+                js(JS_PREV);
+              }
+              return START_NOT_STICKY;
+            }
+
+            @Override
+            public void onDestroy() {
+              inst = null;
+              h.removeCallbacksAndMessages(null);
+              try { session.setActive(false); session.release(); } catch (Exception e) {}
+              stopForeground(true);
+              super.onDestroy();
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) { return null; }
+          }
+          JAVA
+
+          python3 - <<'EOF'
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          perms = (
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n'
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+              '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />\n'
+              '    '
+          )
+          s = s.replace("<application", perms + "<application", 1)
+          svc = '<service android:name=".MusicService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n    '
+          s = s.replace("</application>", svc + "</application>", 1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("Manifest atualizado")
+          EOF
+
+      - name: Compilar APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Control-Music-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
